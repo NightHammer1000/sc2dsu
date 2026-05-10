@@ -1,0 +1,29 @@
+[package]
+name = "sc2dsu"
+version = "0.1.0"
+edition = "2024"
+description = "Cemuhook DSU UDP server feeding 2026 Steam Controller (Triton) gyro + accel into emulators (Cemu, Eden, Citra, …)."
+license = "MIT"
+repository = "https://github.com/NightHammer1000/sc2dsu"
+readme = "README.md"
+keywords = ["steam-controller", "dsu", "cemuhook", "gyro", "hidapi"]
+categories = ["hardware-support", "games"]
+
+[dependencies]
+hidapi = "2.6"
+crc32fast = "1.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+winreg = "0.55"
+nwg = { package = "native-windows-gui", version = "1" }
+nwd = { package = "native-windows-derive", version = "1" }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+embed-manifest = "1"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
