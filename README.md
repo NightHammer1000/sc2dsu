@@ -8,7 +8,7 @@ If an axis is wrong, swap the source or flip invert in the settings window. Save
 
 Run modes: `sc2dsu` (GUI + server), `sc2dsu --tray` (start hidden), `sc2dsu --headless` (server only, log to stderr), `sc2dsu --probe` (enumerate Valve HIDs and dump 3 s of decoded IMU).
 
-Only the Proteus Puck (`0x1304`) was actually plugged in during development. Wired (`0x1302`), BLE (`0x1303`), and Nereid Puck (`0x1305`) are listed in SDL's Triton driver as the same family, so the code path treats them identically — but I have no idea if any of that actually works on real hardware. Reports welcome.
+Only the Proteus Puck (`0x1304`) was actually plugged in during development. Wired (`0x1302`), BLE (`0x1303`), and Nereid Puck (`0x1305`) are listed in SDL's Triton driver as the same family, so the code path treats them identically but I have no idea if any of that actually works on real hardware. Reports welcome.
 
 Build with `cargo build --release`. CI runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo build --release --locked` on every push.
 
