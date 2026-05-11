@@ -1,6 +1,3 @@
-// Windows "run at logon" autostart toggle, via the per-user
-// HKCU\Software\Microsoft\Windows\CurrentVersion\Run registry key.
-
 use std::io;
 use winreg::RegKey;
 use winreg::enums::*;
@@ -10,7 +7,6 @@ const VALUE_NAME: &str = "SC2DSU";
 
 fn current_exe_quoted() -> io::Result<String> {
     let exe = std::env::current_exe()?;
-    // Quote so paths with spaces survive parsing by Windows.
     Ok(format!("\"{}\" --tray", exe.display()))
 }
 
@@ -36,7 +32,6 @@ pub fn disable() -> io::Result<()> {
     let key = hkcu.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)?;
     match key.delete_value(VALUE_NAME) {
         Ok(()) => Ok(()),
-        // Already absent → fine.
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }

@@ -1,7 +1,3 @@
-// Diagnostic probe mode — enumerate every Valve HID interface, try to open each
-// candidate, send the init feature reports, and dump 3 s of decoded gyro/accel.
-// Used to verify the SDL spec against the actual device on the wire.
-
 use crate::triton::{
     self, ImuSample, OpenSlot, TRITON_REPORT_BATTERY, TRITON_REPORT_STATE, TRITON_REPORT_STATE_BLE,
     TRITON_REPORT_WIRELESS, TRITON_REPORT_WIRELESS_X,
@@ -60,19 +56,14 @@ fn probe_one(mut slot: OpenSlot) {
     while Instant::now() < deadline {
         match slot.read_one(50) {
             Ok(Some(s)) => {
-                counts[TRITON_REPORT_STATE as usize] += 1; // approx; some may be BLE
+                counts[TRITON_REPORT_STATE as usize] += 1;
                 imu_seen += 1;
                 if last_print.elapsed() >= Duration::from_millis(100) {
                     print_sample(&s);
                     last_print = Instant::now();
                 }
             }
-            Ok(None) => {
-                // No state report this poll; could be a battery/wireless report or just idle.
-                // We don't currently expose other report IDs through OpenSlot — that's fine for
-                // the probe, since the per-ID histogram below would only matter for debugging
-                // unknown frames.
-            }
+            Ok(None) => {}
             Err(e) => {
                 println!("    read error: {e}");
                 break;

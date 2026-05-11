@@ -1,21 +1,4 @@
-// Hide the console window in release builds — for the GUI app it's noise.
-// Debug builds keep the console so cargo run output stays visible.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
-// SC2DSU — Cemuhook DSU UDP server fed by the 2026 Steam Controller's IMU.
-//
-// Run modes:
-//   sc2dsu               -> GUI (settings window + system tray) + server
-//   sc2dsu --tray        -> Same, but start hidden in tray (use for autostart)
-//   sc2dsu --headless    -> Server only, no GUI (logs to stderr)
-//   sc2dsu --probe       -> Diagnostic: enumerate + dump 3 s of decoded IMU per slot
-//
-// Architecture: the DSU server runs in a worker thread and toggles a shared
-// `device_active` flag whenever its subscriber count crosses 0. A second worker
-// thread owns the HID handle and opens/closes it in response, so the controller
-// is free to enter standby when no emulator is consuming gyro. The main thread
-// owns either the egui/winit message loop (GUI mode) or directly runs the server
-// (headless mode).
 
 mod autostart;
 mod config;
@@ -69,18 +52,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = config::load_or_create();
     let dsu_port = cfg.port;
+    let dsu_expose = cfg.expose_to_network;
     config::install(cfg);
 
-    // Two reasons we might want the controller open:
-    //   • DSU clients are subscribed (the actual emulator workload)
-    //   • The settings window is visible and wants live samples for the viz
-    // The device thread opens the slot if EITHER is true. With both false the
-    // HID handle is released and the controller is free to enter standby.
     let dsu_wants_device = Arc::new(AtomicBool::new(false));
     let ui_wants_device = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
-    // 64 ≈ a quarter second of buffer at 250 Hz. The DSU server normally drains
-    // every iteration; this is just slack for occasional scheduling jitter.
     let (tx, rx) = sync_channel::<triton::ImuSample>(64);
 
     let device_handle = {
@@ -98,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::Builder::new()
             .name("dsu-server".into())
             .spawn(move || -> std::io::Result<()> {
-                let mut server = dsu::Server::bind(dsu_port, dsu_wants, shutdown, rx)?;
+                let mut server = dsu::Server::bind(dsu_port, dsu_expose, dsu_wants, shutdown, rx)?;
                 eprintln!(
                     "sc2dsu DSU server listening on {}  (server id 0x{:08X})",
                     server.local_addr()?,
@@ -111,15 +88,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match mode {
         Mode::Gui { start_minimized } => {
-            // Run the UI on the main thread (eframe + winit need it). When the user
-            // chooses Quit from the tray, the UI sets shutdown=true and closes the
-            // window, returning here. We then wait for the worker threads to wind down.
             ui::run(shutdown.clone(), ui_wants_device.clone(), start_minimized)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         }
         Mode::Headless => {
-            // Block on the server thread directly. Ctrl+C terminates the process; the
-            // OS reclaims sockets and HID handles. Nothing fancy.
             let _ = server_handle.join();
         }
         Mode::Probe => unreachable!(),
@@ -127,8 +99,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     shutdown.store(true, Ordering::Relaxed);
     let _ = device_handle.join();
-    // Don't join the server in GUI mode — it may be blocked on a long recv_timeout.
-    // The shutdown flag has been set and the process is exiting anyway.
     let _ = server_handle;
     Ok(())
 }
@@ -139,12 +109,8 @@ fn run_device_thread(
     shutdown: Arc<AtomicBool>,
     tx: SyncSender<triton::ImuSample>,
 ) {
-    // Threshold for "device is alive but silent" — Steam Input can claim the
-    // device, leave our handle open, and silently disable IMU streaming. After
-    // this many ms with no STATE report, force a close + reopen cycle.
     const SILENCE_REOPEN_MS: u128 = 2000;
 
-    // Open the controller when either consumer wants samples.
     let want_device = || dsu_wants.load(Ordering::Relaxed) || ui_wants.load(Ordering::Relaxed);
 
     let mut api = match HidApi::new() {
@@ -161,9 +127,6 @@ fn run_device_thread(
             continue;
         }
 
-        // Force fresh enumeration. Without this, hidapi caches the snapshot from
-        // HidApi::new() and we miss devices that were grabbed and released by
-        // another process (e.g. Steam Input config UI).
         if let Err(e) = api.refresh_devices() {
             eprintln!("triton: refresh_devices failed ({e}); rebuilding HidApi");
             match HidApi::new() {
@@ -193,7 +156,6 @@ fn run_device_thread(
                 s
             }
             None => {
-                // Steam still holding it, or controller asleep. Back off and retry.
                 thread::sleep(Duration::from_millis(500));
                 continue;
             }
@@ -201,10 +163,6 @@ fn run_device_thread(
 
         let mut consecutive_errors = 0;
         let mut last_sample_at = Instant::now();
-        // Detect the "device open but IMU frozen" failure mode that Steam Input's
-        // config UI triggers: STATE reports keep arriving at full rate but their
-        // timestamp_us never advances. After N stale samples (~400 ms at 250 Hz),
-        // we drop and reopen, which re-sends the IMU-enable feature report.
         let mut last_imu_ts: u32 = 0;
         let mut stale_count: u32 = 0;
         const STALE_THRESHOLD: u32 = 100;
@@ -222,7 +180,6 @@ fn run_device_thread(
                             );
                             break;
                         }
-                        // Drop stale samples — don't push them downstream.
                     } else {
                         stale_count = 0;
                         last_imu_ts = sample.timestamp_us;

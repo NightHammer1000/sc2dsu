@@ -1,20 +1,10 @@
-// Persisted user config — axis mapping, port, etc. Lives at
-// %APPDATA%\sc2dsu\config.toml. Re-read on every IMU sample so edits to the
-// file take effect without restarting the server.
-
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::RwLock;
 
-/// Which raw IMU axis (X / Y / Z, 0..=2) to source each DSU output axis from,
-/// plus a sign flip per output. The default reproduces SDL's mapping for the
-/// Triton, which is correct for SDL gyro consumers but Eden displays the axes
-/// in a different order — adjust here without rebuilding.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Axis {
-    /// Raw IMU axis index (0 = chip X, 1 = chip Y, 2 = chip Z).
     pub source: u8,
-    /// If true, multiply by -1 before sending.
     pub invert: bool,
 }
 
@@ -37,7 +27,6 @@ pub struct AxisMap {
 }
 
 impl Default for AxisMap {
-    /// SDL's mapping for the Triton: DSU_X = raw_X, DSU_Y = raw_Z, DSU_Z = -raw_Y.
     fn default() -> Self {
         Self {
             x: Axis::new(0, false),
@@ -50,15 +39,11 @@ impl Default for AxisMap {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// UDP port for the DSU server.
     pub port: u16,
-    /// Axis remap for the gyroscope.
     pub gyro: AxisMap,
-    /// Axis remap for the accelerometer (usually the same — they share the chip).
     pub accel: AxisMap,
-    /// Hide the settings window at launch and live in the tray. Honored on every
-    /// startup; the `--tray` CLI flag forces this on for one launch regardless.
     pub start_minimized: bool,
+    pub expose_to_network: bool,
 }
 
 impl Default for Config {
@@ -68,6 +53,7 @@ impl Default for Config {
             gyro: AxisMap::default(),
             accel: AxisMap::default(),
             start_minimized: false,
+            expose_to_network: false,
         }
     }
 }
@@ -107,9 +93,6 @@ pub fn load_or_create() -> Config {
     c
 }
 
-/// Process-wide live config. The reader thread re-locks for read on every IMU
-/// sample, so edits to the config file picked up by the watcher take effect
-/// immediately. Writes are rare (manual edit + reload, or future UI).
 pub static LIVE: RwLock<Config> = RwLock::new(Config {
     port: 26760,
     gyro: AxisMap {
@@ -123,6 +106,7 @@ pub static LIVE: RwLock<Config> = RwLock::new(Config {
         z: Axis::new(1, true),
     },
     start_minimized: false,
+    expose_to_network: false,
 });
 
 pub fn install(initial: Config) {
@@ -137,9 +121,6 @@ pub fn snapshot() -> Config {
         .unwrap_or_else(|_| Config::default())
 }
 
-/// Replace the live config and persist it to disk. Returns Err on disk-write failure;
-/// the in-memory config is updated either way (so the change takes effect immediately
-/// even if persistence fails — better than dropping the user's edit).
 pub fn update_and_save(new_cfg: Config) -> std::io::Result<()> {
     if let Ok(mut g) = LIVE.write() {
         *g = new_cfg.clone();
