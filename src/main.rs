@@ -15,6 +15,9 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const SAMPLE_QUEUE_LEN: usize = 64;
+
+#[derive(Debug, PartialEq, Eq)]
 enum Mode {
     Gui { start_minimized: bool },
     Headless,
@@ -22,7 +25,11 @@ enum Mode {
 }
 
 fn parse_args() -> Mode {
-    for arg in std::env::args().skip(1) {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(args: impl Iterator<Item = String>) -> Mode {
+    for arg in args {
         match arg.as_str() {
             "--probe" | "-p" => return Mode::Probe,
             "--headless" | "-H" => return Mode::Headless,
@@ -44,12 +51,33 @@ fn parse_args() -> Mode {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mode = parse_args();
-    if matches!(mode, Mode::Probe) {
-        return probe::run();
+fn attach_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
+    // SAFETY: AttachConsole/AllocConsole take no caller-supplied pointers; a failed
+    // AttachConsole (no parent console, or already attached) is detected via its return
+    // value, and AllocConsole's failure (e.g. console already present) is harmless here.
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            AllocConsole();
+        }
     }
+}
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    match parse_args() {
+        Mode::Probe => {
+            attach_console();
+            probe::run()
+        }
+        Mode::Headless => {
+            attach_console();
+            run_server(None)
+        }
+        Mode::Gui { start_minimized } => run_server(Some(start_minimized)),
+    }
+}
+
+fn run_server(gui_start_minimized: Option<bool>) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load_or_create();
     let dsu_port = cfg.port;
     let dsu_expose = cfg.expose_to_network;
@@ -58,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dsu_wants_device = Arc::new(AtomicBool::new(false));
     let ui_wants_device = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = sync_channel::<triton::ImuSample>(64);
+    let (tx, rx) = sync_channel::<triton::ImuSample>(SAMPLE_QUEUE_LEN);
 
     let device_handle = {
         let dsu_wants = dsu_wants_device.clone();
@@ -86,20 +114,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?
     };
 
-    match mode {
-        Mode::Gui { start_minimized } => {
+    match gui_start_minimized {
+        Some(start_minimized) => {
             ui::run(shutdown.clone(), ui_wants_device.clone(), start_minimized)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         }
-        Mode::Headless => {
+        None => {
             let _ = server_handle.join();
         }
-        Mode::Probe => unreachable!(),
     }
 
     shutdown.store(true, Ordering::Relaxed);
     let _ = device_handle.join();
-    let _ = server_handle;
     Ok(())
 }
 
@@ -109,8 +135,6 @@ fn run_device_thread(
     shutdown: Arc<AtomicBool>,
     tx: SyncSender<triton::ImuSample>,
 ) {
-    const SILENCE_REOPEN_MS: u128 = 2000;
-
     let want_device = || dsu_wants.load(Ordering::Relaxed) || ui_wants.load(Ordering::Relaxed);
 
     let mut api = match HidApi::new() {
@@ -161,54 +185,126 @@ fn run_device_thread(
             }
         };
 
-        let mut consecutive_errors = 0;
-        let mut last_sample_at = Instant::now();
-        let mut last_imu_ts: u32 = 0;
-        let mut stale_count: u32 = 0;
-        const STALE_THRESHOLD: u32 = 100;
-        while want_device() && !shutdown.load(Ordering::Relaxed) {
-            match slot.read_one(50) {
-                Ok(Some(sample)) => {
-                    consecutive_errors = 0;
-                    last_sample_at = Instant::now();
-                    if sample.timestamp_us == last_imu_ts {
-                        stale_count += 1;
-                        if stale_count >= STALE_THRESHOLD {
-                            eprintln!(
-                                "triton: IMU timestamp frozen for {} samples — Steam likely disabled IMU; reopening slot",
-                                STALE_THRESHOLD
-                            );
-                            break;
-                        }
-                    } else {
-                        stale_count = 0;
-                        last_imu_ts = sample.timestamp_us;
-                        let _ = tx.try_send(sample);
-                    }
-                }
-                Ok(None) => {
-                    consecutive_errors = 0;
-                    if last_sample_at.elapsed().as_millis() >= SILENCE_REOPEN_MS {
-                        eprintln!(
-                            "triton: no STATE reports for {} ms — Steam likely commandeered the device; reopening slot",
-                            SILENCE_REOPEN_MS
-                        );
-                        break;
-                    }
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    if consecutive_errors >= 5 {
-                        eprintln!("triton: 5 consecutive read errors ({e}); reopening slot");
-                        break;
-                    }
-                }
-            }
-        }
+        run_slot(&mut slot, &tx, &want_device, &shutdown);
         eprintln!(
             "triton: closing slot (dsu_wants={}, ui_wants={})",
             dsu_wants.load(Ordering::Relaxed),
             ui_wants.load(Ordering::Relaxed)
+        );
+    }
+}
+
+fn run_slot(
+    slot: &mut triton::OpenSlot,
+    tx: &SyncSender<triton::ImuSample>,
+    want_device: &impl Fn() -> bool,
+    shutdown: &AtomicBool,
+) {
+    const SILENCE_REOPEN_MS: u128 = 2000;
+    const STALE_THRESHOLD: u32 = 100;
+
+    let mut consecutive_errors = 0u32;
+    let mut last_sample_at = Instant::now();
+    let mut last_imu_ts: u32 = 0;
+    let mut stale_count: u32 = 0;
+    while want_device() && !shutdown.load(Ordering::Relaxed) {
+        match slot.read_one(50) {
+            Ok(Some(sample)) => {
+                consecutive_errors = 0;
+                last_sample_at = Instant::now();
+                if sample.timestamp_us == last_imu_ts {
+                    stale_count += 1;
+                    if stale_count >= STALE_THRESHOLD {
+                        eprintln!(
+                            "triton: IMU timestamp frozen for {} samples — Steam likely disabled IMU; reopening slot",
+                            STALE_THRESHOLD
+                        );
+                        return;
+                    }
+                } else {
+                    stale_count = 0;
+                    last_imu_ts = sample.timestamp_us;
+                    let _ = tx.try_send(sample);
+                }
+            }
+            Ok(None) => {
+                consecutive_errors = 0;
+                if last_sample_at.elapsed().as_millis() >= SILENCE_REOPEN_MS {
+                    eprintln!(
+                        "triton: no STATE reports for {} ms — Steam likely commandeered the device; reopening slot",
+                        SILENCE_REOPEN_MS
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= 5 {
+                    eprintln!("triton: 5 consecutive read errors ({e}); reopening slot");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Mode {
+        parse_args_from(args.iter().map(|s| (*s).to_string()))
+    }
+
+    #[test]
+    fn parse_args_defaults_to_visible_gui() {
+        assert_eq!(
+            parse(&[]),
+            Mode::Gui {
+                start_minimized: false
+            }
+        );
+        assert_eq!(
+            parse(&["some-positional-arg"]),
+            Mode::Gui {
+                start_minimized: false
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_recognizes_each_mode() {
+        assert_eq!(parse(&["--probe"]), Mode::Probe);
+        assert_eq!(parse(&["-p"]), Mode::Probe);
+        assert_eq!(parse(&["--headless"]), Mode::Headless);
+        assert_eq!(parse(&["-H"]), Mode::Headless);
+        assert_eq!(
+            parse(&["--gui"]),
+            Mode::Gui {
+                start_minimized: false
+            }
+        );
+        assert_eq!(
+            parse(&["--tray"]),
+            Mode::Gui {
+                start_minimized: true
+            }
+        );
+        assert_eq!(
+            parse(&["--minimized"]),
+            Mode::Gui {
+                start_minimized: true
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_uses_first_recognized_flag() {
+        assert_eq!(
+            parse(&["--gui", "--probe"]),
+            Mode::Gui {
+                start_minimized: false
+            }
         );
     }
 }

@@ -10,6 +10,7 @@ pub const PID_NEREID_DONGLE: u16 = 0x1305;
 
 const FEATURE_REPORT_ID: u8 = 0x01;
 const FEATURE_REPORT_BYTES: usize = 64;
+const INPUT_REPORT_BYTES: usize = 64;
 const ID_SET_SETTINGS_VALUES: u8 = 0x87;
 const SETTING_LIZARD_MODE: u8 = 9;
 const SETTING_IMU_MODE: u8 = 48;
@@ -17,9 +18,12 @@ const LIZARD_MODE_OFF: u16 = 0;
 const GYRO_MODE_RAW_ACCEL_AND_GYRO: u16 = 0x0008 | 0x0010;
 
 pub const TRITON_REPORT_STATE: u8 = 0x42;
-pub const TRITON_REPORT_BATTERY: u8 = 0x43;
 pub const TRITON_REPORT_STATE_BLE: u8 = 0x45;
+#[allow(dead_code)]
+pub const TRITON_REPORT_BATTERY: u8 = 0x43;
+#[allow(dead_code)]
 pub const TRITON_REPORT_WIRELESS_X: u8 = 0x46;
+#[allow(dead_code)]
 pub const TRITON_REPORT_WIRELESS: u8 = 0x79;
 
 const LIZARD_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
@@ -70,7 +74,11 @@ fn build_set_setting_report(setting_num: u8, setting_value: u16) -> [u8; FEATURE
     buf
 }
 
-pub fn parse_imu(payload: &[u8]) -> Option<ImuSample> {
+pub fn parse_imu(
+    payload: &[u8],
+    gyro_map: &config::AxisMap,
+    accel_map: &config::AxisMap,
+) -> Option<ImuSample> {
     const IMU_OFFSET: usize = 29;
     const IMU_NOQUAT_LEN: usize = 16;
     if payload.len() < IMU_OFFSET + IMU_NOQUAT_LEN {
@@ -87,18 +95,17 @@ pub fn parse_imu(payload: &[u8]) -> Option<ImuSample> {
     let raw_accel_f = [to_g(raw_accel.0), to_g(raw_accel.1), to_g(raw_accel.2)];
     let raw_gyro_f = [to_dps(raw_gyro.0), to_dps(raw_gyro.1), to_dps(raw_gyro.2)];
 
-    let cfg = config::snapshot();
     Some(ImuSample {
         timestamp_us: ts,
         accel_g: [
-            cfg.accel.x.apply(raw_accel_f),
-            cfg.accel.y.apply(raw_accel_f),
-            cfg.accel.z.apply(raw_accel_f),
+            accel_map.x.apply(raw_accel_f),
+            accel_map.y.apply(raw_accel_f),
+            accel_map.z.apply(raw_accel_f),
         ],
         gyro_dps: [
-            cfg.gyro.x.apply(raw_gyro_f),
-            cfg.gyro.y.apply(raw_gyro_f),
-            cfg.gyro.z.apply(raw_gyro_f),
+            gyro_map.x.apply(raw_gyro_f),
+            gyro_map.y.apply(raw_gyro_f),
+            gyro_map.z.apply(raw_gyro_f),
         ],
     })
 }
@@ -107,6 +114,9 @@ pub struct OpenSlot {
     dev: HidDevice,
     last_lizard_refresh: Instant,
     last_imu_refresh: Instant,
+    gyro_map: config::AxisMap,
+    accel_map: config::AxisMap,
+    cfg_generation: u64,
     pub interface_number: i32,
     pub product_id: u16,
 }
@@ -123,10 +133,15 @@ impl OpenSlot {
         dev.send_feature_report(&imu)
             .map_err(|e| format!("imu-on: {e}"))?;
         let _ = dev.set_blocking_mode(false);
+        let cfg_generation = config::generation();
+        let cfg = config::snapshot();
         Ok(Self {
             dev,
             last_lizard_refresh: Instant::now(),
             last_imu_refresh: Instant::now(),
+            gyro_map: cfg.gyro,
+            accel_map: cfg.accel,
+            cfg_generation,
             interface_number: info.interface_number(),
             product_id: info.product_id(),
         })
@@ -143,13 +158,20 @@ impl OpenSlot {
             let _ = self.dev.send_feature_report(&imu);
             self.last_imu_refresh = Instant::now();
         }
-        let mut buf = [0u8; 64];
+        let live_generation = config::generation();
+        if live_generation != self.cfg_generation {
+            let cfg = config::snapshot();
+            self.gyro_map = cfg.gyro;
+            self.accel_map = cfg.accel;
+            self.cfg_generation = live_generation;
+        }
+        let mut buf = [0u8; INPUT_REPORT_BYTES];
         match self.dev.read_timeout(&mut buf, timeout_ms) {
             Ok(0) => Ok(None),
             Ok(n) => {
                 let id = buf[0];
                 if id == TRITON_REPORT_STATE || id == TRITON_REPORT_STATE_BLE {
-                    Ok(parse_imu(&buf[1..n]))
+                    Ok(parse_imu(&buf[1..n], &self.gyro_map, &self.accel_map))
                 } else {
                     Ok(None)
                 }
@@ -160,7 +182,73 @@ impl OpenSlot {
 }
 
 pub fn find_active_slot(api: &HidApi, candidates: &[DeviceInfo]) -> Option<OpenSlot> {
-    candidates
-        .iter()
-        .find_map(|info| OpenSlot::open(api, info).ok())
+    for info in candidates {
+        match OpenSlot::open(api, info) {
+            Ok(slot) => return Some(slot),
+            Err(e) => eprintln!(
+                "triton: open iface {} (PID {:04X}) failed: {e}",
+                info.interface_number(),
+                info.product_id()
+            ),
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity_map() -> config::AxisMap {
+        config::AxisMap {
+            x: config::Axis::new(0, false),
+            y: config::Axis::new(1, false),
+            z: config::Axis::new(2, false),
+        }
+    }
+
+    fn build_imu_payload(ts: u32, accel_raw: [i16; 3], gyro_raw: [i16; 3]) -> Vec<u8> {
+        let mut p = vec![0u8; 45];
+        p[29..33].copy_from_slice(&ts.to_le_bytes());
+        for (i, v) in accel_raw.iter().enumerate() {
+            p[33 + i * 2..35 + i * 2].copy_from_slice(&v.to_le_bytes());
+        }
+        for (i, v) in gyro_raw.iter().enumerate() {
+            p[39 + i * 2..41 + i * 2].copy_from_slice(&v.to_le_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn parse_imu_rejects_short_payload() {
+        assert!(parse_imu(&[0u8; 44], &identity_map(), &identity_map()).is_none());
+    }
+
+    #[test]
+    fn parse_imu_decodes_full_scale_values() {
+        let payload = build_imu_payload(0x1234_5678, [16384, 0, -16384], [16384, -16384, 0]);
+        let s = parse_imu(&payload, &identity_map(), &identity_map()).unwrap();
+        assert_eq!(s.timestamp_us, 0x1234_5678);
+        assert!((s.accel_g[0] - 1.0).abs() < 1e-4);
+        assert!(s.accel_g[1].abs() < 1e-4);
+        assert!((s.accel_g[2] + 1.0).abs() < 1e-4);
+        assert!((s.gyro_dps[0] - 1000.0).abs() < 1e-2);
+        assert!((s.gyro_dps[1] + 1000.0).abs() < 1e-2);
+        assert!(s.gyro_dps[2].abs() < 1e-2);
+    }
+
+    #[test]
+    fn parse_imu_applies_axis_mapping() {
+        let payload = build_imu_payload(0, [1000, 2000, 3000], [100, 200, 300]);
+        let swap_xy = config::AxisMap {
+            x: config::Axis::new(1, false),
+            y: config::Axis::new(0, true),
+            z: config::Axis::new(2, false),
+        };
+        let direct = parse_imu(&payload, &identity_map(), &identity_map()).unwrap();
+        let mapped = parse_imu(&payload, &swap_xy, &identity_map()).unwrap();
+        assert!((mapped.gyro_dps[0] - direct.gyro_dps[1]).abs() < 1e-6);
+        assert!((mapped.gyro_dps[1] + direct.gyro_dps[0]).abs() < 1e-6);
+        assert!((mapped.gyro_dps[2] - direct.gyro_dps[2]).abs() < 1e-6);
+    }
 }

@@ -1,7 +1,4 @@
-use crate::triton::{
-    self, ImuSample, OpenSlot, TRITON_REPORT_BATTERY, TRITON_REPORT_STATE, TRITON_REPORT_STATE_BLE,
-    TRITON_REPORT_WIRELESS, TRITON_REPORT_WIRELESS_X,
-};
+use crate::triton::{self, ImuSample, OpenSlot};
 use hidapi::HidApi;
 use std::time::{Duration, Instant};
 
@@ -50,13 +47,11 @@ fn probe_one(mut slot: OpenSlot) {
         slot.interface_number, slot.product_id
     );
     let deadline = Instant::now() + Duration::from_secs(3);
-    let mut counts = [0u32; 256];
     let mut imu_seen = 0u32;
     let mut last_print = Instant::now();
     while Instant::now() < deadline {
         match slot.read_one(50) {
             Ok(Some(s)) => {
-                counts[TRITON_REPORT_STATE as usize] += 1;
                 imu_seen += 1;
                 if last_print.elapsed() >= Duration::from_millis(100) {
                     print_sample(&s);
@@ -70,20 +65,7 @@ fn probe_one(mut slot: OpenSlot) {
             }
         }
     }
-
-    println!("    --- 3 s summary ---");
-    print_count("STATE/STATE_BLE", counts[TRITON_REPORT_STATE as usize]);
-    print_count("BATTERY", counts[TRITON_REPORT_BATTERY as usize]);
-    print_count("WIRELESS", counts[TRITON_REPORT_WIRELESS as usize]);
-    print_count("WIRELESS_X", counts[TRITON_REPORT_WIRELESS_X as usize]);
-    print_count("STATE_BLE", counts[TRITON_REPORT_STATE_BLE as usize]);
-    println!("    IMU-bearing frames decoded: {imu_seen}");
-}
-
-fn print_count(label: &str, n: u32) {
-    if n > 0 {
-        println!("      {label:<22} {n:>6}");
-    }
+    println!("    --- 3 s summary: {imu_seen} IMU-bearing STATE frames decoded ---");
 }
 
 fn print_sample(s: &ImuSample) {

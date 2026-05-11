@@ -1,14 +1,33 @@
 use crate::{autostart, config, stats};
 use nwd::NwgUi;
 use nwg::NativeUi;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use windows_sys::Win32::Graphics::Gdi::HDC;
 
 const W: i32 = 540;
-const H: i32 = 776;
+const H: i32 = 810;
 
 const AXIS_LABELS: [&str; 3] = ["raw X", "raw Y", "raw Z"];
+
+const VIZ_BG_COLOR: u32 = 0x0020_2020;
+const VIZ_EDGE_COLOR: u32 = 0x0060_E080;
+const AXIS_X_COLOR: u32 = 0x0000_00FF;
+const AXIS_Y_COLOR: u32 = 0x0000_FF00;
+const AXIS_Z_COLOR: u32 = 0x00FF_0000;
+
+fn checkbox_state(on: bool) -> nwg::CheckBoxState {
+    if on {
+        nwg::CheckBoxState::Checked
+    } else {
+        nwg::CheckBoxState::Unchecked
+    }
+}
+
+fn is_checked(chk: &nwg::CheckBox) -> bool {
+    matches!(chk.check_state(), nwg::CheckBoxState::Checked)
+}
 
 #[derive(Default, NwgUi)]
 pub struct App {
@@ -141,7 +160,7 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::on_change])]
     chk_az: nwg::CheckBox,
 
-    #[nwg_control(parent: window, position: (10, 486), size: (W - 20, 88))]
+    #[nwg_control(parent: window, position: (10, 486), size: (W - 20, 116))]
     sys_frame: nwg::Frame,
     #[nwg_control(parent: sys_frame, position: (10, 10), size: (260, 18), text: "System")]
     lbl_sys_hdr: nwg::Label,
@@ -164,7 +183,11 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::on_start_min_toggle])]
     chk_start_min: nwg::CheckBox,
 
-    #[nwg_control(parent: Some(&data.window), position: (10, 582), size: (W - 20, 152))]
+    #[nwg_control(parent: sys_frame, position: (12, 90), size: (440, 18), text: "Hide to tray on window close (don't quit)")]
+    #[nwg_events(OnButtonClick: [App::on_close_to_tray_toggle])]
+    chk_close_to_tray: nwg::CheckBox,
+
+    #[nwg_control(parent: Some(&data.window), position: (10, 610), size: (W - 20, 152))]
     #[nwg_events(OnPaint: [App::on_viz_paint(SELF, EVT_DATA)])]
     viz_canvas: nwg::ExternCanvas,
 
@@ -183,10 +206,10 @@ pub struct App {
     #[nwg_control(parent: window, position: (340, H - 32), size: (200, 18), text: "")]
     lbl_save: nwg::Label,
 
-    shutdown: RefCell<Arc<AtomicBool>>,
+    shutdown: Arc<AtomicBool>,
     suppress_change: Cell<bool>,
     start_min_requested: Cell<bool>,
-    ui_wants_device: RefCell<Arc<AtomicBool>>,
+    ui_wants_device: Arc<AtomicBool>,
 }
 
 impl App {
@@ -206,32 +229,19 @@ impl App {
         self.populate_from_config();
         self.suppress_change.set(false);
 
-        let on = autostart::is_enabled();
-        self.chk_autostart.set_check_state(if on {
-            nwg::CheckBoxState::Checked
-        } else {
-            nwg::CheckBoxState::Unchecked
-        });
+        self.chk_autostart
+            .set_check_state(checkbox_state(autostart::is_enabled()));
 
         let cfg = config::snapshot();
-        self.chk_start_min.set_check_state(if cfg.start_minimized {
-            nwg::CheckBoxState::Checked
-        } else {
-            nwg::CheckBoxState::Unchecked
-        });
-        self.chk_expose.set_check_state(if cfg.expose_to_network {
-            nwg::CheckBoxState::Checked
-        } else {
-            nwg::CheckBoxState::Unchecked
-        });
+        self.chk_start_min
+            .set_check_state(checkbox_state(cfg.start_minimized));
+        self.chk_expose
+            .set_check_state(checkbox_state(cfg.expose_to_network));
+        self.chk_close_to_tray
+            .set_check_state(checkbox_state(cfg.close_to_tray));
 
         let hidden = cfg.start_minimized || self.start_min_requested.get();
-        if hidden {
-            self.window.set_visible(false);
-        }
-        if let Ok(b) = self.ui_wants_device.try_borrow() {
-            b.store(!hidden, Ordering::Relaxed);
-        }
+        self.set_window_shown(!hidden);
     }
 
     fn populate_from_config(&self) {
@@ -252,11 +262,7 @@ impl App {
         chk: &nwg::CheckBox,
     ) {
         cb.set_selection(Some((axis.source as usize).min(2)));
-        chk.set_check_state(if axis.invert {
-            nwg::CheckBoxState::Checked
-        } else {
-            nwg::CheckBoxState::Unchecked
-        });
+        chk.set_check_state(checkbox_state(axis.invert));
     }
 
     fn read_axis_widgets(
@@ -265,8 +271,7 @@ impl App {
         chk: &nwg::CheckBox,
     ) -> config::Axis {
         let source = cb.selection().unwrap_or(0).min(2) as u8;
-        let invert = matches!(chk.check_state(), nwg::CheckBoxState::Checked);
-        config::Axis::new(source, invert)
+        config::Axis::new(source, is_checked(chk))
     }
 
     fn on_change(&self) {
@@ -280,11 +285,15 @@ impl App {
         cfg.accel.x = self.read_axis_widgets(&self.cb_ax, &self.chk_ax);
         cfg.accel.y = self.read_axis_widgets(&self.cb_ay, &self.chk_ay);
         cfg.accel.z = self.read_axis_widgets(&self.cb_az, &self.chk_az);
-        if let Ok(p) = self.edit_port.text().parse::<u16>() {
-            cfg.port = p;
+        let port_text = self.edit_port.text();
+        let mut note: &str = "saved.";
+        match port_text.parse::<u16>() {
+            Ok(p) => cfg.port = p,
+            Err(_) if port_text.trim().is_empty() => {}
+            Err(_) => note = "saved — port field ignored (need a number 0-65535).",
         }
         match config::update_and_save(cfg) {
-            Ok(()) => self.lbl_save.set_text("saved."),
+            Ok(()) => self.lbl_save.set_text(note),
             Err(e) => self.lbl_save.set_text(&format!("save failed: {e}")),
         }
     }
@@ -300,10 +309,7 @@ impl App {
     }
 
     fn on_start_min_toggle(&self) {
-        let want = matches!(
-            self.chk_start_min.check_state(),
-            nwg::CheckBoxState::Checked
-        );
+        let want = is_checked(&self.chk_start_min);
         let mut cfg = config::snapshot();
         cfg.start_minimized = want;
         match config::update_and_save(cfg) {
@@ -317,7 +323,7 @@ impl App {
     }
 
     fn on_expose_toggle(&self) {
-        let want = matches!(self.chk_expose.check_state(), nwg::CheckBoxState::Checked);
+        let want = is_checked(&self.chk_expose);
         let mut cfg = config::snapshot();
         cfg.expose_to_network = want;
         match config::update_and_save(cfg) {
@@ -330,11 +336,22 @@ impl App {
         }
     }
 
+    fn on_close_to_tray_toggle(&self) {
+        let want = is_checked(&self.chk_close_to_tray);
+        let mut cfg = config::snapshot();
+        cfg.close_to_tray = want;
+        match config::update_and_save(cfg) {
+            Ok(()) => self.lbl_save.set_text(if want {
+                "close button now hides to tray."
+            } else {
+                "close button now quits."
+            }),
+            Err(e) => self.lbl_save.set_text(&format!("save failed: {e}")),
+        }
+    }
+
     fn on_autostart_toggle(&self) {
-        let want = matches!(
-            self.chk_autostart.check_state(),
-            nwg::CheckBoxState::Checked
-        );
+        let want = is_checked(&self.chk_autostart);
         let res = if want {
             autostart::enable()
         } else {
@@ -354,11 +371,7 @@ impl App {
 
     fn refresh_stats(&self) {
         let s = stats::snapshot();
-        let host = if config::snapshot().expose_to_network {
-            "0.0.0.0"
-        } else {
-            "127.0.0.1"
-        };
+        let host = config::bind_host(config::snapshot().expose_to_network);
         self.lbl_addr.set_text(&format!(
             "Listening on:    {}",
             if s.bound_port == 0 {
@@ -404,8 +417,8 @@ impl App {
     fn on_viz_paint(&self, evt: &nwg::EventData) {
         use windows_sys::Win32::Foundation::RECT;
         use windows_sys::Win32::Graphics::Gdi::{
-            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush,
-            DeleteDC, DeleteObject, FillRect, LineTo, MoveToEx, PS_SOLID, SRCCOPY, SelectObject,
+            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
+            DeleteObject, FillRect, SRCCOPY, SelectObject,
         };
         use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
 
@@ -414,7 +427,7 @@ impl App {
             _ => return,
         };
         let paint = pd.begin_paint();
-        let screen_hdc: windows_sys::Win32::Graphics::Gdi::HDC = paint.hdc as _;
+        let screen_hdc: HDC = paint.hdc as _;
         let raw_hwnd = match self.viz_canvas.handle {
             nwg::ControlHandle::Hwnd(h) => h,
             _ => {
@@ -424,90 +437,37 @@ impl App {
         };
         let hwnd: windows_sys::Win32::Foundation::HWND = raw_hwnd as _;
 
+        // SAFETY: RECT is a plain struct of i32 fields; an all-zero value is valid.
         let mut rect: RECT = unsafe { std::mem::zeroed() };
+        // SAFETY: hwnd is a live window handle from the canvas; &mut rect is a valid out-pointer.
         unsafe { GetClientRect(hwnd, &mut rect) };
         let w_px = rect.right - rect.left;
         let h_px = rect.bottom - rect.top;
-        let w = w_px as f32;
-        let h = h_px as f32;
-
-        let mem_dc = unsafe { CreateCompatibleDC(screen_hdc) };
-        let mem_bm = unsafe { CreateCompatibleBitmap(screen_hdc, w_px, h_px) };
-        let old_bm = unsafe { SelectObject(mem_dc, mem_bm as _) };
-
-        unsafe {
-            let bg = CreateSolidBrush(0x202020);
-            FillRect(mem_dc, &rect, bg);
-            let _ = DeleteObject(bg as _);
-        }
+        let cx = (w_px as f32) * 0.5;
+        let cy = (h_px as f32) * 0.5;
+        let scale = (h_px as f32) * 0.32;
 
         let q = stats::snapshot().orientation;
-
-        let cx = w * 0.5;
-        let cy = h * 0.5;
-        let scale = h * 0.32;
         let project = |v: [f32; 3]| -> (i32, i32) {
             let r = quat_rotate(q, v);
             ((cx + r[0] * scale) as i32, (cy - r[1] * scale) as i32)
         };
 
-        let verts: [[f32; 3]; 8] = [
-            [-1.0, -0.4, -1.0],
-            [1.0, -0.4, -1.0],
-            [1.0, 0.4, -1.0],
-            [-1.0, 0.4, -1.0],
-            [-1.0, -0.4, 1.0],
-            [1.0, -0.4, 1.0],
-            [1.0, 0.4, 1.0],
-            [-1.0, 0.4, 1.0],
-        ];
-        let edges: [(usize, usize); 12] = [
-            (0, 1),
-            (1, 2),
-            (2, 3),
-            (3, 0),
-            (4, 5),
-            (5, 6),
-            (6, 7),
-            (7, 4),
-            (0, 4),
-            (1, 5),
-            (2, 6),
-            (3, 7),
-        ];
-
+        // SAFETY: screen_hdc is the live paint DC. Every GDI object created in this block
+        // (the offscreen DC, its bitmap, the background brush) is selected/used and then
+        // restored or deleted before the block returns, so no handles leak.
         unsafe {
-            let pen = CreatePen(PS_SOLID, 2, 0x60E080);
-            let old = SelectObject(mem_dc, pen as _);
-            for (a, b) in edges {
-                let p0 = project(verts[a]);
-                let p1 = project(verts[b]);
-                MoveToEx(mem_dc, p0.0, p0.1, std::ptr::null_mut());
-                LineTo(mem_dc, p1.0, p1.1);
-            }
-            SelectObject(mem_dc, old);
-            let _ = DeleteObject(pen as _);
-        }
+            let mem_dc = CreateCompatibleDC(screen_hdc);
+            let mem_bm = CreateCompatibleBitmap(screen_hdc, w_px, h_px);
+            let old_bm = SelectObject(mem_dc, mem_bm as _);
 
-        let axes: [([f32; 3], u32); 3] = [
-            ([1.6, 0.0, 0.0], 0x0000FF),
-            ([0.0, 1.6, 0.0], 0x00FF00),
-            ([0.0, 0.0, 1.6], 0xFF0000),
-        ];
-        let origin = project([0.0, 0.0, 0.0]);
-        for (v, color) in axes {
-            unsafe {
-                let pen = CreatePen(PS_SOLID, 3, color);
-                let old = SelectObject(mem_dc, pen as _);
-                MoveToEx(mem_dc, origin.0, origin.1, std::ptr::null_mut());
-                let tip = project(v);
-                LineTo(mem_dc, tip.0, tip.1);
-                SelectObject(mem_dc, old);
-                let _ = DeleteObject(pen as _);
-            }
-        }
+            let bg = CreateSolidBrush(VIZ_BG_COLOR);
+            FillRect(mem_dc, &rect, bg);
+            let _ = DeleteObject(bg as _);
 
-        unsafe {
+            draw_wireframe_cube(mem_dc, &project);
+            draw_axes_gizmo(mem_dc, &project);
+
             BitBlt(screen_hdc, 0, 0, w_px, h_px, mem_dc, 0, 0, SRCCOPY);
             SelectObject(mem_dc, old_bm);
             let _ = DeleteObject(mem_bm as _);
@@ -517,19 +477,27 @@ impl App {
         pd.end_paint(&paint);
     }
 
+    fn set_window_shown(&self, shown: bool) {
+        self.window.set_visible(shown);
+        if shown {
+            self.window.restore();
+        }
+        self.ui_wants_device.store(shown, Ordering::Relaxed);
+    }
+
     fn on_close(&self, evt: &nwg::EventData) {
         if let nwg::EventData::OnWindowClose(close) = evt {
             close.close(false);
         }
-        self.window.set_visible(false);
+        if config::snapshot().close_to_tray {
+            self.set_window_shown(false);
+        } else {
+            self.on_quit();
+        }
     }
 
     fn on_tray_left(&self) {
-        let visible = self.window.visible();
-        self.window.set_visible(!visible);
-        if !visible {
-            self.window.restore();
-        }
+        self.set_window_shown(!self.window.visible());
     }
 
     fn on_tray_right(&self) {
@@ -538,18 +506,11 @@ impl App {
     }
 
     fn show_window(&self) {
-        self.window.set_visible(true);
-        self.window.restore();
-        if let Ok(b) = self.ui_wants_device.try_borrow() {
-            b.store(true, Ordering::Relaxed);
-        }
+        self.set_window_shown(true);
     }
 
     fn hide_window(&self) {
-        self.window.set_visible(false);
-        if let Ok(b) = self.ui_wants_device.try_borrow() {
-            b.store(false, Ordering::Relaxed);
-        }
+        self.set_window_shown(false);
     }
 
     fn on_recenter(&self) {
@@ -558,9 +519,7 @@ impl App {
     }
 
     fn on_quit(&self) {
-        if let Ok(s) = self.shutdown.try_borrow() {
-            s.store(true, Ordering::Relaxed);
-        }
+        self.shutdown.store(true, Ordering::Relaxed);
         nwg::stop_thread_dispatch();
     }
 }
@@ -574,8 +533,8 @@ pub fn run(
     set_global_font()?;
 
     let app = App {
-        shutdown: RefCell::new(shutdown),
-        ui_wants_device: RefCell::new(ui_wants_device),
+        shutdown,
+        ui_wants_device,
         start_min_requested: Cell::new(start_minimized),
         ..Default::default()
     };
@@ -597,6 +556,75 @@ fn set_global_font() -> Result<(), String> {
 
 const BLUE_ICO_BYTES: &[u8] = include_bytes!("../assets/tray.ico");
 
+fn draw_wireframe_cube(dc: HDC, project: &dyn Fn([f32; 3]) -> (i32, i32)) {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreatePen, DeleteObject, LineTo, MoveToEx, PS_SOLID, SelectObject,
+    };
+    const VERTS: [[f32; 3]; 8] = [
+        [-1.0, -0.4, -1.0],
+        [1.0, -0.4, -1.0],
+        [1.0, 0.4, -1.0],
+        [-1.0, 0.4, -1.0],
+        [-1.0, -0.4, 1.0],
+        [1.0, -0.4, 1.0],
+        [1.0, 0.4, 1.0],
+        [-1.0, 0.4, 1.0],
+    ];
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    // SAFETY: dc is a valid HDC owned by the caller; the pen is created, selected,
+    // restored, and deleted within this block, leaving the DC as it was found.
+    unsafe {
+        let pen = CreatePen(PS_SOLID, 2, VIZ_EDGE_COLOR);
+        let old = SelectObject(dc, pen as _);
+        for (a, b) in EDGES {
+            let p0 = project(VERTS[a]);
+            let p1 = project(VERTS[b]);
+            MoveToEx(dc, p0.0, p0.1, std::ptr::null_mut());
+            LineTo(dc, p1.0, p1.1);
+        }
+        SelectObject(dc, old);
+        let _ = DeleteObject(pen as _);
+    }
+}
+
+fn draw_axes_gizmo(dc: HDC, project: &dyn Fn([f32; 3]) -> (i32, i32)) {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreatePen, DeleteObject, LineTo, MoveToEx, PS_SOLID, SelectObject,
+    };
+    let axes: [([f32; 3], u32); 3] = [
+        ([1.6, 0.0, 0.0], AXIS_X_COLOR),
+        ([0.0, 1.6, 0.0], AXIS_Y_COLOR),
+        ([0.0, 0.0, 1.6], AXIS_Z_COLOR),
+    ];
+    let origin = project([0.0, 0.0, 0.0]);
+    for (v, color) in axes {
+        // SAFETY: dc is a valid HDC owned by the caller; each pen is created, selected,
+        // restored, and deleted within this iteration.
+        unsafe {
+            let pen = CreatePen(PS_SOLID, 3, color);
+            let old = SelectObject(dc, pen as _);
+            MoveToEx(dc, origin.0, origin.1, std::ptr::null_mut());
+            let tip = project(v);
+            LineTo(dc, tip.0, tip.1);
+            SelectObject(dc, old);
+            let _ = DeleteObject(pen as _);
+        }
+    }
+}
+
 fn quat_rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
     let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
     let qx = [x, y, z];
@@ -612,4 +640,32 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5)
+    }
+
+    #[test]
+    fn quat_rotate_identity_is_noop() {
+        let v = [0.3, -1.2, 4.0];
+        assert!(approx_eq(quat_rotate([1.0, 0.0, 0.0, 0.0], v), v));
+    }
+
+    #[test]
+    fn quat_rotate_90deg_about_z_maps_x_to_y() {
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let r = quat_rotate([s, 0.0, 0.0, s], [1.0, 0.0, 0.0]);
+        assert!(approx_eq(r, [0.0, 1.0, 0.0]), "got {r:?}");
+    }
+
+    #[test]
+    fn cross_of_basis_vectors() {
+        assert_eq!(cross([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]), [0.0, 0.0, 1.0]);
+        assert_eq!(cross([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]), [1.0, 0.0, 0.0]);
+    }
 }

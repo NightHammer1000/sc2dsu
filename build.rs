@@ -13,6 +13,8 @@ fn main() {
 
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         use embed_manifest::manifest::{DpiAwareness, Setting};
+        // The GUI uses a fixed-pixel nwd layout; declare DPI-unaware + GDI scaling so
+        // Windows bitmap-stretches the whole window rather than leaving it tiny on hi-DPI.
         embed_manifest::embed_manifest(
             embed_manifest::new_manifest("sc2dsu")
                 .dpi_awareness(DpiAwareness::Unaware)

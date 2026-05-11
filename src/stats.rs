@@ -17,7 +17,7 @@ pub struct ServerStats {
     pub bound_port: u16,
 }
 
-pub static LIVE: RwLock<ServerStats> = RwLock::new(ServerStats {
+static LIVE: RwLock<ServerStats> = RwLock::new(ServerStats {
     subscribers: 0,
     requests_per_sec: 0.0,
     samples_per_sec: 0.0,
@@ -31,19 +31,16 @@ pub static LIVE: RwLock<ServerStats> = RwLock::new(ServerStats {
 });
 
 pub fn snapshot() -> ServerStats {
-    LIVE.read().map(|g| *g).unwrap_or_default()
+    *LIVE.read().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn publish(s: ServerStats) {
-    if let Ok(mut g) = LIVE.write() {
-        *g = s;
-    }
+    *LIVE.write().unwrap_or_else(|e| e.into_inner()) = s;
 }
 
 pub fn publish_motion(gyro_dps: [f32; 3], accel_g: [f32; 3], orientation: [f32; 4]) {
-    if let Ok(mut g) = LIVE.write() {
-        g.last_gyro_dps = gyro_dps;
-        g.last_accel_g = accel_g;
-        g.orientation = orientation;
-    }
+    let mut g = LIVE.write().unwrap_or_else(|e| e.into_inner());
+    g.last_gyro_dps = gyro_dps;
+    g.last_accel_g = accel_g;
+    g.orientation = orientation;
 }
