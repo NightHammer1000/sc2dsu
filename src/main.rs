@@ -86,7 +86,7 @@ fn run_server(gui_start_minimized: Option<bool>) -> Result<(), Box<dyn std::erro
     let dsu_wants_device = Arc::new(AtomicBool::new(false));
     let ui_wants_device = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = sync_channel::<triton::ImuSample>(SAMPLE_QUEUE_LEN);
+    let (tx, rx) = sync_channel::<triton::ControllerState>(SAMPLE_QUEUE_LEN);
 
     let device_handle = {
         let dsu_wants = dsu_wants_device.clone();
@@ -133,7 +133,7 @@ fn run_device_thread(
     dsu_wants: Arc<AtomicBool>,
     ui_wants: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    tx: SyncSender<triton::ImuSample>,
+    tx: SyncSender<triton::ControllerState>,
 ) {
     let want_device = || dsu_wants.load(Ordering::Relaxed) || ui_wants.load(Ordering::Relaxed);
 
@@ -196,7 +196,7 @@ fn run_device_thread(
 
 fn run_slot(
     slot: &mut triton::OpenSlot,
-    tx: &SyncSender<triton::ImuSample>,
+    tx: &SyncSender<triton::ControllerState>,
     want_device: &impl Fn() -> bool,
     shutdown: &AtomicBool,
 ) {
@@ -212,7 +212,7 @@ fn run_slot(
             Ok(Some(sample)) => {
                 consecutive_errors = 0;
                 last_sample_at = Instant::now();
-                if sample.timestamp_us == last_imu_ts {
+                if sample.imu.timestamp_us == last_imu_ts {
                     stale_count += 1;
                     if stale_count >= STALE_THRESHOLD {
                         eprintln!(
@@ -223,7 +223,7 @@ fn run_slot(
                     }
                 } else {
                     stale_count = 0;
-                    last_imu_ts = sample.timestamp_us;
+                    last_imu_ts = sample.imu.timestamp_us;
                     let _ = tx.try_send(sample);
                 }
             }

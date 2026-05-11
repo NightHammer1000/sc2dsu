@@ -1,4 +1,4 @@
-use crate::triton::{self, ImuSample, OpenSlot};
+use crate::triton::{self, ControllerState, OpenSlot};
 use hidapi::HidApi;
 use std::time::{Duration, Instant};
 
@@ -47,12 +47,12 @@ fn probe_one(mut slot: OpenSlot) {
         slot.interface_number, slot.product_id
     );
     let deadline = Instant::now() + Duration::from_secs(3);
-    let mut imu_seen = 0u32;
+    let mut frames_seen = 0u32;
     let mut last_print = Instant::now();
     while Instant::now() < deadline {
         match slot.read_one(50) {
             Ok(Some(s)) => {
-                imu_seen += 1;
+                frames_seen += 1;
                 if last_print.elapsed() >= Duration::from_millis(100) {
                     print_sample(&s);
                     last_print = Instant::now();
@@ -65,18 +65,25 @@ fn probe_one(mut slot: OpenSlot) {
             }
         }
     }
-    println!("    --- 3 s summary: {imu_seen} IMU-bearing STATE frames decoded ---");
+    println!("    --- 3 s summary: {frames_seen} STATE frames decoded ---");
 }
 
-fn print_sample(s: &ImuSample) {
+fn print_sample(s: &ControllerState) {
     println!(
-        "      ts={:>10} gyro(dps)=[{:>+8.2} {:>+8.2} {:>+8.2}]  accel(g)=[{:>+6.3} {:>+6.3} {:>+6.3}]",
-        s.timestamp_us,
-        s.gyro_dps[0],
-        s.gyro_dps[1],
-        s.gyro_dps[2],
-        s.accel_g[0],
-        s.accel_g[1],
-        s.accel_g[2],
+        "      ts={:>10}  buttons=0x{:05X}  L=({:>+6},{:>+6}) R=({:>+6},{:>+6})  trig=({:>5},{:>5})  gyro(dps)=[{:>+8.2} {:>+8.2} {:>+8.2}]  accel(g)=[{:>+6.3} {:>+6.3} {:>+6.3}]",
+        s.imu.timestamp_us,
+        s.buttons,
+        s.left_stick[0],
+        s.left_stick[1],
+        s.right_stick[0],
+        s.right_stick[1],
+        s.trigger_left,
+        s.trigger_right,
+        s.imu.gyro_dps[0],
+        s.imu.gyro_dps[1],
+        s.imu.gyro_dps[2],
+        s.imu.accel_g[0],
+        s.imu.accel_g[1],
+        s.imu.accel_g[2],
     );
 }

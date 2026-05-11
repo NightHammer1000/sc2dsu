@@ -36,6 +36,40 @@ pub struct ImuSample {
     pub gyro_dps: [f32; 3],
 }
 
+#[allow(dead_code)]
+pub mod button {
+    pub const A: u32 = 0x0000_0001;
+    pub const B: u32 = 0x0000_0002;
+    pub const X: u32 = 0x0000_0004;
+    pub const Y: u32 = 0x0000_0008;
+    pub const QAM: u32 = 0x0000_0010;
+    pub const R3: u32 = 0x0000_0020;
+    pub const VIEW: u32 = 0x0000_0040;
+    pub const R4: u32 = 0x0000_0080;
+    pub const R5: u32 = 0x0000_0100;
+    pub const R: u32 = 0x0000_0200;
+    pub const DPAD_DOWN: u32 = 0x0000_0400;
+    pub const DPAD_RIGHT: u32 = 0x0000_0800;
+    pub const DPAD_LEFT: u32 = 0x0000_1000;
+    pub const DPAD_UP: u32 = 0x0000_2000;
+    pub const MENU: u32 = 0x0000_4000;
+    pub const L3: u32 = 0x0000_8000;
+    pub const STEAM: u32 = 0x0001_0000;
+    pub const L4: u32 = 0x0002_0000;
+    pub const L5: u32 = 0x0004_0000;
+    pub const L: u32 = 0x0008_0000;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ControllerState {
+    pub buttons: u32,
+    pub trigger_left: u16,
+    pub trigger_right: u16,
+    pub left_stick: [i16; 2],
+    pub right_stick: [i16; 2],
+    pub imu: ImuSample,
+}
+
 pub fn pid_label(pid: u16) -> &'static str {
     match pid {
         PID_TRITON_WIRED => "Triton wired",
@@ -110,6 +144,24 @@ pub fn parse_imu(
     })
 }
 
+pub fn parse_state(
+    payload: &[u8],
+    gyro_map: &config::AxisMap,
+    accel_map: &config::AxisMap,
+) -> Option<ControllerState> {
+    let imu = parse_imu(payload, gyro_map, accel_map)?;
+    let u16le = |o: usize| u16::from_le_bytes([payload[o], payload[o + 1]]);
+    let i16le = |o: usize| i16::from_le_bytes([payload[o], payload[o + 1]]);
+    Some(ControllerState {
+        buttons: u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]),
+        trigger_left: u16le(5),
+        trigger_right: u16le(7),
+        left_stick: [i16le(9), i16le(11)],
+        right_stick: [i16le(13), i16le(15)],
+        imu,
+    })
+}
+
 pub struct OpenSlot {
     dev: HidDevice,
     last_lizard_refresh: Instant,
@@ -147,7 +199,7 @@ impl OpenSlot {
         })
     }
 
-    pub fn read_one(&mut self, timeout_ms: i32) -> Result<Option<ImuSample>, String> {
+    pub fn read_one(&mut self, timeout_ms: i32) -> Result<Option<ControllerState>, String> {
         if self.last_lizard_refresh.elapsed() >= LIZARD_REFRESH_INTERVAL {
             let lizard = build_set_setting_report(SETTING_LIZARD_MODE, LIZARD_MODE_OFF);
             let _ = self.dev.send_feature_report(&lizard);
@@ -171,7 +223,7 @@ impl OpenSlot {
             Ok(n) => {
                 let id = buf[0];
                 if id == TRITON_REPORT_STATE || id == TRITON_REPORT_STATE_BLE {
-                    Ok(parse_imu(&buf[1..n], &self.gyro_map, &self.accel_map))
+                    Ok(parse_state(&buf[1..n], &self.gyro_map, &self.accel_map))
                 } else {
                     Ok(None)
                 }
@@ -250,5 +302,29 @@ mod tests {
         assert!((mapped.gyro_dps[0] - direct.gyro_dps[1]).abs() < 1e-6);
         assert!((mapped.gyro_dps[1] + direct.gyro_dps[0]).abs() < 1e-6);
         assert!((mapped.gyro_dps[2] - direct.gyro_dps[2]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_state_decodes_buttons_sticks_triggers() {
+        let mut p = build_imu_payload(0x1111_2222, [1, 2, 3], [4, 5, 6]);
+        p[1..5].copy_from_slice(&(button::A | button::DPAD_LEFT | button::STEAM).to_le_bytes());
+        p[5..7].copy_from_slice(&1234u16.to_le_bytes());
+        p[7..9].copy_from_slice(&31000u16.to_le_bytes());
+        p[9..11].copy_from_slice(&(-100i16).to_le_bytes());
+        p[11..13].copy_from_slice(&200i16.to_le_bytes());
+        p[13..15].copy_from_slice(&(-300i16).to_le_bytes());
+        p[15..17].copy_from_slice(&400i16.to_le_bytes());
+        let s = parse_state(&p, &identity_map(), &identity_map()).unwrap();
+        assert_eq!(s.buttons, button::A | button::DPAD_LEFT | button::STEAM);
+        assert_eq!(s.trigger_left, 1234);
+        assert_eq!(s.trigger_right, 31000);
+        assert_eq!(s.left_stick, [-100, 200]);
+        assert_eq!(s.right_stick, [-300, 400]);
+        assert_eq!(s.imu.timestamp_us, 0x1111_2222);
+    }
+
+    #[test]
+    fn parse_state_rejects_short_payload() {
+        assert!(parse_state(&[0u8; 30], &identity_map(), &identity_map()).is_none());
     }
 }

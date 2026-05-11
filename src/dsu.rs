@@ -1,6 +1,6 @@
 use crate::config;
 use crate::stats;
-use crate::triton::ImuSample;
+use crate::triton::{self, ControllerState};
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
 use std::net::{SocketAddr, UdpSocket};
@@ -59,7 +59,7 @@ pub struct Server {
     subscribers: HashMap<u32, Subscriber>,
     dsu_wants_device: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    sample_rx: Receiver<ImuSample>,
+    sample_rx: Receiver<ControllerState>,
     last_gyro: [f32; 3],
     last_accel: [f32; 3],
     last_cleanup: Instant,
@@ -77,7 +77,7 @@ impl Server {
         expose_to_network: bool,
         dsu_wants_device: Arc<AtomicBool>,
         shutdown: Arc<AtomicBool>,
-        sample_rx: Receiver<ImuSample>,
+        sample_rx: Receiver<ControllerState>,
     ) -> io::Result<Self> {
         let socket = UdpSocket::bind((config::bind_host(expose_to_network), port))?;
         socket.set_read_timeout(Some(RECV_TIMEOUT))?;
@@ -147,8 +147,8 @@ impl Server {
             match self.sample_rx.try_recv() {
                 Ok(s) => {
                     self.samples_in_window += 1;
-                    self.last_gyro = s.gyro_dps;
-                    self.last_accel = s.accel_g;
+                    self.last_gyro = s.imu.gyro_dps;
+                    self.last_accel = s.imu.accel_g;
                     self.broadcast_data_packet(&s);
                     if stats::RECENTER_REQUEST.swap(false, Ordering::Relaxed) {
                         self.orientation_q = [1.0, 0.0, 0.0, 0.0];
@@ -161,9 +161,9 @@ impl Server {
                     };
                     self.last_sample_at = Some(now);
                     if dt > 0.0 {
-                        integrate_gyro(&mut self.orientation_q, s.gyro_dps, dt);
+                        integrate_gyro(&mut self.orientation_q, s.imu.gyro_dps, dt);
                     }
-                    stats::publish_motion(s.gyro_dps, s.accel_g, self.orientation_q);
+                    stats::publish_motion(s.imu.gyro_dps, s.imu.accel_g, self.orientation_q);
                 }
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => {
@@ -325,7 +325,7 @@ impl Server {
         Ok(())
     }
 
-    fn broadcast_data_packet(&mut self, sample: &ImuSample) {
+    fn broadcast_data_packet(&mut self, sample: &ControllerState) {
         if self.subscribers.is_empty() {
             return;
         }
@@ -383,26 +383,110 @@ fn write_controller_header(buf: &mut [u8], slot: u8) {
     }
 }
 
-fn write_data_body(body: &mut [u8], sample: &ImuSample) {
+const TRIGGER_DIGITAL_THRESHOLD: u8 = 200;
+
+fn write_data_body(body: &mut [u8], state: &ControllerState) {
     const B_CONNECTED: usize = 0;
+    const B_BUTTONS: usize = 5;
     const B_STICKS: usize = 9;
+    const B_ANALOG: usize = 13;
     const B_TIMESTAMP: usize = 37;
     const B_MOTION: usize = 45;
+
     body[B_CONNECTED] = 1;
-    body[B_STICKS..B_STICKS + 4].fill(127);
-    body[B_TIMESTAMP..B_TIMESTAMP + 8].copy_from_slice(&(sample.timestamp_us as u64).to_le_bytes());
+
+    let l2 = trigger_to_u8(state.trigger_left);
+    let r2 = trigger_to_u8(state.trigger_right);
+    body[B_BUTTONS..B_BUTTONS + 4].copy_from_slice(&dsu_button_bytes(
+        state.buttons,
+        l2 >= TRIGGER_DIGITAL_THRESHOLD,
+        r2 >= TRIGGER_DIGITAL_THRESHOLD,
+    ));
+
+    body[B_STICKS] = stick_to_u8(state.left_stick[0]);
+    body[B_STICKS + 1] = stick_to_u8(state.left_stick[1]);
+    body[B_STICKS + 2] = stick_to_u8(state.right_stick[0]);
+    body[B_STICKS + 3] = stick_to_u8(state.right_stick[1]);
+
+    let pressed = |mask: u32| state.buttons & mask != 0;
+    let full = |on: bool| if on { u8::MAX } else { 0 };
+    let analog: [u8; 12] = {
+        use triton::button as bt;
+        [
+            full(pressed(bt::DPAD_LEFT)),
+            full(pressed(bt::DPAD_DOWN)),
+            full(pressed(bt::DPAD_RIGHT)),
+            full(pressed(bt::DPAD_UP)),
+            full(pressed(bt::Y)),
+            full(pressed(bt::B)),
+            full(pressed(bt::A)),
+            full(pressed(bt::X)),
+            full(pressed(bt::R)),
+            full(pressed(bt::L)),
+            r2,
+            l2,
+        ]
+    };
+    body[B_ANALOG..B_ANALOG + analog.len()].copy_from_slice(&analog);
+
+    body[B_TIMESTAMP..B_TIMESTAMP + 8]
+        .copy_from_slice(&(state.imu.timestamp_us as u64).to_le_bytes());
     let motion = [
-        sample.accel_g[0],
-        sample.accel_g[1],
-        sample.accel_g[2],
-        sample.gyro_dps[0],
-        sample.gyro_dps[1],
-        sample.gyro_dps[2],
+        state.imu.accel_g[0],
+        state.imu.accel_g[1],
+        state.imu.accel_g[2],
+        state.imu.gyro_dps[0],
+        state.imu.gyro_dps[1],
+        state.imu.gyro_dps[2],
     ];
     for (i, v) in motion.iter().enumerate() {
         let off = B_MOTION + i * 4;
         body[off..off + 4].copy_from_slice(&v.to_le_bytes());
     }
+}
+
+fn dsu_button_bytes(buttons: u32, l2_down: bool, r2_down: bool) -> [u8; 4] {
+    use triton::button as bt;
+    let down = |mask: u32| buttons & mask != 0;
+    let buttons1 = pack_bits(&[
+        (down(bt::MENU), 0),
+        (down(bt::L3), 1),
+        (down(bt::R3), 2),
+        (down(bt::VIEW), 3),
+        (down(bt::DPAD_UP), 4),
+        (down(bt::DPAD_RIGHT), 5),
+        (down(bt::DPAD_DOWN), 6),
+        (down(bt::DPAD_LEFT), 7),
+    ]);
+    let buttons2 = pack_bits(&[
+        (l2_down, 0),
+        (r2_down, 1),
+        (down(bt::L), 2),
+        (down(bt::R), 3),
+        (down(bt::X), 4),
+        (down(bt::A), 5),
+        (down(bt::B), 6),
+        (down(bt::Y), 7),
+    ]);
+    [
+        buttons1,
+        buttons2,
+        u8::from(down(bt::STEAM)),
+        u8::from(down(bt::QAM)),
+    ]
+}
+
+fn pack_bits(bits: &[(bool, u8)]) -> u8 {
+    bits.iter()
+        .fold(0u8, |acc, &(on, pos)| acc | (u8::from(on) << pos))
+}
+
+fn stick_to_u8(v: i16) -> u8 {
+    ((i32::from(v) + 32768) >> 8) as u8
+}
+
+fn trigger_to_u8(v: u16) -> u8 {
+    (v >> 7).min(255) as u8
 }
 
 fn read_u8(c: &mut Cursor<&[u8]>) -> io::Result<u8> {
@@ -496,16 +580,67 @@ mod tests {
     }
 
     #[test]
-    fn data_body_encodes_motion_at_expected_offsets() {
+    fn stick_and_trigger_scaling() {
+        assert_eq!(stick_to_u8(0), 128);
+        assert_eq!(stick_to_u8(i16::MIN), 0);
+        assert_eq!(stick_to_u8(i16::MAX), 255);
+        assert_eq!(trigger_to_u8(0), 0);
+        assert_eq!(trigger_to_u8(0x7FFF), 255);
+        assert_eq!(trigger_to_u8(0x8000), 255);
+        let mid = trigger_to_u8(0x4000);
+        assert!((100..160).contains(&mid), "mid pull = {mid}");
+    }
+
+    #[test]
+    fn dsu_button_bytes_maps_buttons_to_correct_bits() {
+        use crate::triton::button as bt;
+        let bit = |n: u8| 1u8 << n;
+        let [b1, b2, home, touch] = dsu_button_bytes(bt::A | bt::DPAD_UP | bt::STEAM, false, false);
+        assert_eq!(b1, bit(4));
+        assert_eq!(b2, bit(5));
+        assert_eq!(home, 1);
+        assert_eq!(touch, 0);
+
+        let [b1, b2, home, touch] = dsu_button_bytes(
+            bt::MENU | bt::VIEW | bt::L | bt::R | bt::Y | bt::QAM,
+            true,
+            true,
+        );
+        assert_eq!(b1, bit(0) | bit(3));
+        assert_eq!(b2, bit(0) | bit(1) | bit(2) | bit(3) | bit(7));
+        assert_eq!(home, 0);
+        assert_eq!(touch, 1);
+
+        assert_eq!(
+            dsu_button_bytes(bt::L4 | bt::L5 | bt::R4 | bt::R5, false, false),
+            [0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn data_body_encodes_buttons_sticks_and_motion() {
         let mut body = vec![0u8; 80];
-        let sample = ImuSample {
-            timestamp_us: 0xABCD_1234,
-            accel_g: [0.25, -0.5, 1.0],
-            gyro_dps: [10.0, -20.0, 30.0],
+        let state = ControllerState {
+            buttons: triton::button::B | triton::button::DPAD_LEFT,
+            trigger_left: 0x7FFF,
+            trigger_right: 0,
+            left_stick: [i16::MAX, i16::MIN],
+            right_stick: [0, 0],
+            imu: triton::ImuSample {
+                timestamp_us: 0xABCD_1234,
+                accel_g: [0.25, -0.5, 1.0],
+                gyro_dps: [10.0, -20.0, 30.0],
+            },
         };
-        write_data_body(&mut body, &sample);
+        write_data_body(&mut body, &state);
         assert_eq!(body[0], 1);
-        assert_eq!(&body[9..13], &[127, 127, 127, 127]);
+        assert_eq!(body[5], 0b1000_0000);
+        assert_eq!(body[6], 0b0100_0001);
+        assert_eq!(body[7], 0);
+        assert_eq!(body[8], 0);
+        assert_eq!(&body[9..13], &[255, 0, 128, 128]);
+        assert_eq!(&body[13..25], &[255, 0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 255]);
+        assert_eq!(&body[25..37], &[0u8; 12]);
         assert_eq!(
             u64::from_le_bytes(body[37..45].try_into().unwrap()),
             0xABCD_1234u64
@@ -516,6 +651,27 @@ mod tests {
         assert_eq!(f32::from_le_bytes(body[57..61].try_into().unwrap()), 10.0);
         assert_eq!(f32::from_le_bytes(body[61..65].try_into().unwrap()), -20.0);
         assert_eq!(f32::from_le_bytes(body[65..69].try_into().unwrap()), 30.0);
+    }
+
+    #[test]
+    fn partial_trigger_pull_sets_analog_but_not_digital() {
+        let mut body = vec![0u8; 80];
+        let state = ControllerState {
+            buttons: 0,
+            trigger_left: 0x3200,
+            trigger_right: 0,
+            left_stick: [0, 0],
+            right_stick: [0, 0],
+            imu: triton::ImuSample {
+                timestamp_us: 0,
+                accel_g: [0.0; 3],
+                gyro_dps: [0.0; 3],
+            },
+        };
+        assert!(trigger_to_u8(state.trigger_left) < TRIGGER_DIGITAL_THRESHOLD);
+        write_data_body(&mut body, &state);
+        assert_eq!(body[6], 0);
+        assert_eq!(body[24], trigger_to_u8(0x3200));
     }
 
     #[test]
