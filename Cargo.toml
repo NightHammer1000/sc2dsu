@@ -1,6 +1,6 @@
 [package]
 name = "sc2dsu"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Cemuhook DSU UDP server feeding 2026 Steam Controller (Triton) gyro + accel into emulators (Cemu, Eden, Citra, …)."
 license = "MIT"
