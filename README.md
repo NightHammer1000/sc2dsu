@@ -13,3 +13,9 @@ Only the Proteus Puck (`0x1304`) was actually plugged in during development. Wir
 Build with `cargo build --release`. CI runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo build --release --locked` on every push.
 
 HID protocol from SDL3 [`SDL_hidapi_steam_triton.c`](https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/SDL_hidapi_steam_triton.c) and [steam/](https://github.com/libsdl-org/SDL/tree/main/src/joystick/hidapi/steam) headers. DSU protocol from [v1993/gcemuhook](https://github.com/v1993/gcemuhook). MIT.
+
+
+Like it? Found it useful?
+
+You can help fuel my caffeine addiction here:
+https://ko-fi.com/nightstorm1000
