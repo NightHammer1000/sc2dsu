@@ -172,6 +172,7 @@ pub struct OpenSlot {
     gyro_map: config::AxisMap,
     accel_map: config::AxisMap,
     gyro_cal: GyroCalibration,
+    auto_calibrate: bool,
     last_imu_ts_us: Option<u32>,
     cfg_generation: u64,
     pub interface_number: i32,
@@ -199,6 +200,7 @@ impl OpenSlot {
             gyro_map: cfg.gyro,
             accel_map: cfg.accel,
             gyro_cal: GyroCalibration::new(),
+            auto_calibrate: cfg.auto_calibrate,
             last_imu_ts_us: None,
             cfg_generation,
             interface_number: info.interface_number(),
@@ -222,8 +224,10 @@ impl OpenSlot {
             let cfg = config::snapshot();
             self.gyro_map = cfg.gyro;
             self.accel_map = cfg.accel;
+            self.auto_calibrate = cfg.auto_calibrate;
             self.cfg_generation = live_generation;
             // Bias is estimated in the post-mapping frame; a remap invalidates it.
+            // Toggling auto-calibrate also resets so re-enabling starts fresh.
             self.gyro_cal.reset();
             self.last_imu_ts_us = None;
         }
@@ -253,9 +257,16 @@ impl OpenSlot {
                         None => 0.0,
                     };
                     self.last_imu_ts_us = Some(state.imu.timestamp_us);
-                    state.imu.gyro_dps =
-                        self.gyro_cal
-                            .correct(state.imu.gyro_dps, state.imu.accel_g, dt);
+                    if self.auto_calibrate {
+                        state.imu.gyro_dps =
+                            self.gyro_cal
+                                .correct(state.imu.gyro_dps, state.imu.accel_g, dt);
+                    }
+                    stats::publish_calibration(stats::CalibrationSection {
+                        active: self.auto_calibrate,
+                        steady: self.gyro_cal.is_steady(),
+                        confidence: self.gyro_cal.confidence(),
+                    });
                     Ok(Some(state))
                 } else {
                     Ok(None)

@@ -61,7 +61,6 @@ pub struct Server {
     shutdown: Arc<AtomicBool>,
     sample_rx: Receiver<ControllerState>,
     last_gyro: [f32; 3],
-    last_accel: [f32; 3],
     last_cleanup: Instant,
     last_stats: Instant,
     samples_in_window: u32,
@@ -90,7 +89,6 @@ impl Server {
             shutdown,
             sample_rx,
             last_gyro: [0.0; 3],
-            last_accel: [0.0; 3],
             last_cleanup: Instant::now(),
             last_stats: Instant::now(),
             samples_in_window: 0,
@@ -148,7 +146,6 @@ impl Server {
                 Ok(s) => {
                     self.samples_in_window += 1;
                     self.last_gyro = s.imu.gyro_dps;
-                    self.last_accel = s.imu.accel_g;
                     self.broadcast_data_packet(&s);
                     if stats::RECENTER_REQUEST.swap(false, Ordering::Relaxed) {
                         self.orientation_q = [1.0, 0.0, 0.0, 0.0];
@@ -163,7 +160,11 @@ impl Server {
                     if dt > 0.0 {
                         integrate_gyro(&mut self.orientation_q, s.imu.gyro_dps, dt);
                     }
-                    stats::publish_motion(s.imu.gyro_dps, s.imu.accel_g, self.orientation_q);
+                    stats::publish_motion(stats::MotionSection {
+                        last_gyro_dps: s.imu.gyro_dps,
+                        last_accel_g: s.imu.accel_g,
+                        orientation: self.orientation_q,
+                    });
                 }
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => {
@@ -177,7 +178,6 @@ impl Server {
     fn emit_stats(&mut self) {
         let secs = self.last_stats.elapsed().as_secs_f32();
         let gyro = self.last_gyro;
-        let accel = self.last_accel;
         let gmag = (gyro[0] * gyro[0] + gyro[1] * gyro[1] + gyro[2] * gyro[2]).sqrt();
         let device_active_now = self.dsu_wants_device.load(Ordering::Relaxed);
         eprintln!(
@@ -192,14 +192,11 @@ impl Server {
             gmag,
             device_active_now,
         );
-        stats::publish(stats::ServerStats {
+        stats::publish_server(stats::ServerSection {
             subscribers: self.subscribers.len(),
             requests_per_sec: self.requests_in_window as f32 / secs,
             samples_per_sec: self.samples_in_window as f32 / secs,
             packets_per_sec: self.packets_in_window as f32 / secs,
-            last_gyro_dps: gyro,
-            last_accel_g: accel,
-            orientation: self.orientation_q,
             device_active: device_active_now,
             server_id: self.server_id,
             bound_port: self.socket.local_addr().map(|a| a.port()).unwrap_or(0),

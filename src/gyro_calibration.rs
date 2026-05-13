@@ -116,6 +116,14 @@ impl GyroCalibration {
         *self = Self::new();
     }
 
+    pub fn is_steady(&self) -> bool {
+        self.is_steady
+    }
+
+    pub fn confidence(&self) -> f32 {
+        self.confidence
+    }
+
     /// Take a fresh (post-axis-mapping) gyro/accel sample and dt seconds since
     /// the previous sample. Updates the bias estimate when the controller is
     /// detected stationary, and returns the bias-corrected gyro.

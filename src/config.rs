@@ -59,6 +59,7 @@ pub struct Config {
     pub start_minimized: bool,
     pub expose_to_network: bool,
     pub close_to_tray: bool,
+    pub auto_calibrate: bool,
 }
 
 impl Config {
@@ -69,6 +70,7 @@ impl Config {
         start_minimized: false,
         expose_to_network: false,
         close_to_tray: false,
+        auto_calibrate: true,
     };
 }
 
@@ -183,6 +185,7 @@ mod tests {
         assert_eq!(parsed.gyro, AxisMap::DEFAULT);
         assert_eq!(parsed.accel, AxisMap::DEFAULT_ACCEL);
         assert!(!parsed.expose_to_network);
+        assert!(parsed.auto_calibrate);
     }
 
     #[test]
