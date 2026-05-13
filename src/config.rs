@@ -28,10 +28,19 @@ pub struct AxisMap {
 }
 
 impl AxisMap {
+    // Gyro mapping matched to Eden/Yuzu Cemuhook UDP, which reads incoming DSU
+    // as (pitch, roll, -yaw). See issue #3.
     pub const DEFAULT: Self = Self {
         x: Axis::new(0, false),
-        y: Axis::new(2, false),
-        z: Axis::new(1, true),
+        y: Axis::new(2, true),
+        z: Axis::new(1, false),
+    };
+
+    // Accel mapping for the same Eden/Yuzu remap: (accel.x, -accel.z, accel.y).
+    pub const DEFAULT_ACCEL: Self = Self {
+        x: Axis::new(0, true),
+        y: Axis::new(2, true),
+        z: Axis::new(1, false),
     };
 }
 
@@ -56,7 +65,7 @@ impl Config {
     pub const DEFAULT: Self = Self {
         port: 26760,
         gyro: AxisMap::DEFAULT,
-        accel: AxisMap::DEFAULT,
+        accel: AxisMap::DEFAULT_ACCEL,
         start_minimized: false,
         expose_to_network: false,
         close_to_tray: false,
@@ -172,7 +181,7 @@ mod tests {
         let parsed: Config = toml::from_str("port = 12345").unwrap();
         assert_eq!(parsed.port, 12345);
         assert_eq!(parsed.gyro, AxisMap::DEFAULT);
-        assert_eq!(parsed.accel, AxisMap::DEFAULT);
+        assert_eq!(parsed.accel, AxisMap::DEFAULT_ACCEL);
         assert!(!parsed.expose_to_network);
     }
 
