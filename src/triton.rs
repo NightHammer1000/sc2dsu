@@ -1,5 +1,8 @@
 use crate::config;
+use crate::gyro_calibration::GyroCalibration;
+use crate::stats;
 use hidapi::{DeviceInfo, HidApi, HidDevice};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 pub const VID_VALVE: u16 = 0x28DE;
@@ -168,6 +171,8 @@ pub struct OpenSlot {
     last_imu_refresh: Instant,
     gyro_map: config::AxisMap,
     accel_map: config::AxisMap,
+    gyro_cal: GyroCalibration,
+    last_imu_ts_us: Option<u32>,
     cfg_generation: u64,
     pub interface_number: i32,
     pub product_id: u16,
@@ -193,6 +198,8 @@ impl OpenSlot {
             last_imu_refresh: Instant::now(),
             gyro_map: cfg.gyro,
             accel_map: cfg.accel,
+            gyro_cal: GyroCalibration::new(),
+            last_imu_ts_us: None,
             cfg_generation,
             interface_number: info.interface_number(),
             product_id: info.product_id(),
@@ -216,6 +223,13 @@ impl OpenSlot {
             self.gyro_map = cfg.gyro;
             self.accel_map = cfg.accel;
             self.cfg_generation = live_generation;
+            // Bias is estimated in the post-mapping frame; a remap invalidates it.
+            self.gyro_cal.reset();
+            self.last_imu_ts_us = None;
+        }
+        if stats::RECALIBRATE_REQUEST.swap(false, Ordering::Relaxed) {
+            self.gyro_cal.reset();
+            self.last_imu_ts_us = None;
         }
         let mut buf = [0u8; INPUT_REPORT_BYTES];
         match self.dev.read_timeout(&mut buf, timeout_ms) {
@@ -223,7 +237,26 @@ impl OpenSlot {
             Ok(n) => {
                 let id = buf[0];
                 if id == TRITON_REPORT_STATE || id == TRITON_REPORT_STATE_BLE {
-                    Ok(parse_state(&buf[1..n], &self.gyro_map, &self.accel_map))
+                    let Some(mut state) = parse_state(&buf[1..n], &self.gyro_map, &self.accel_map)
+                    else {
+                        return Ok(None);
+                    };
+                    let dt = match self.last_imu_ts_us {
+                        Some(prev) => {
+                            let delta = state.imu.timestamp_us.wrapping_sub(prev);
+                            // Clamp at 100 ms — a longer gap means we lost the
+                            // stream (Steam took the device, reopen, etc.) and
+                            // pretending it's one big step is worse than
+                            // skipping the update.
+                            (delta as f32 / 1_000_000.0).clamp(0.0, 0.1)
+                        }
+                        None => 0.0,
+                    };
+                    self.last_imu_ts_us = Some(state.imu.timestamp_us);
+                    state.imu.gyro_dps =
+                        self.gyro_cal
+                            .correct(state.imu.gyro_dps, state.imu.accel_g, dt);
+                    Ok(Some(state))
                 } else {
                     Ok(None)
                 }

@@ -3,6 +3,7 @@
 mod autostart;
 mod config;
 mod dsu;
+mod gyro_calibration;
 mod probe;
 mod stats;
 mod triton;

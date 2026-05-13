@@ -2,6 +2,7 @@ use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 
 pub static RECENTER_REQUEST: AtomicBool = AtomicBool::new(false);
+pub static RECALIBRATE_REQUEST: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerStats {

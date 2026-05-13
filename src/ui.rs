@@ -515,7 +515,8 @@ impl App {
 
     fn on_recenter(&self) {
         stats::RECENTER_REQUEST.store(true, Ordering::Relaxed);
-        self.lbl_save.set_text("recentered.");
+        stats::RECALIBRATE_REQUEST.store(true, Ordering::Relaxed);
+        self.lbl_save.set_text("recentered & recalibrating gyro.");
     }
 
     fn on_quit(&self) {
