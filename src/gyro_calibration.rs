@@ -268,17 +268,17 @@ mod tests {
         // 3 s of perfectly still input — well past the 2.0 s correction window.
         feed_stationary(&mut cal, true_bias, 3.0);
         assert!(cal.is_steady, "should be steady after 3s stationary");
-        for i in 0..3 {
+        for (i, &want) in true_bias.iter().enumerate() {
             assert!(
-                (cal.bias[i] - true_bias[i]).abs() < 0.05,
+                (cal.bias[i] - want).abs() < 0.05,
                 "bias[{i}]={} not within 0.05 of {}",
                 cal.bias[i],
-                true_bias[i]
+                want
             );
         }
         let out = cal.correct(true_bias, GRAVITY, DT);
-        for i in 0..3 {
-            assert!(out[i].abs() < 0.05, "out[{i}]={} not near 0", out[i]);
+        for (i, &v) in out.iter().enumerate() {
+            assert!(v.abs() < 0.05, "out[{i}]={v} not near 0");
         }
     }
 
@@ -322,9 +322,9 @@ mod tests {
             );
         }
         assert!(!cal.is_steady);
-        for i in 0..3 {
+        for (i, &before) in locked_bias.iter().enumerate() {
             assert!(
-                (cal.bias[i] - locked_bias[i]).abs() < 0.05,
+                (cal.bias[i] - before).abs() < 0.05,
                 "bias drifted during motion: was {:?} now {:?}",
                 locked_bias,
                 cal.bias
