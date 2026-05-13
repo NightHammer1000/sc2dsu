@@ -551,7 +551,10 @@ impl App {
             buttons: nwg::MessageButtons::YesNo,
             icons: nwg::MessageIcons::Warning,
         };
-        if !matches!(nwg::modal_message(&self.window, &prompt), nwg::MessageChoice::Yes) {
+        if !matches!(
+            nwg::modal_message(&self.window, &prompt),
+            nwg::MessageChoice::Yes
+        ) {
             return;
         }
         match config::update_and_save(config::Config::DEFAULT) {
