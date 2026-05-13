@@ -97,6 +97,10 @@ pub struct App {
     #[nwg_control(parent: gyro_frame, position: (10, 10), size: (260, 18), text: "Gyro axis mapping")]
     lbl_gyro_hdr: nwg::Label,
 
+    #[nwg_control(parent: gyro_frame, position: (290, 8), size: (220, 22), text: "Auto-calibrate bias")]
+    #[nwg_events(OnButtonClick: [App::on_auto_cal_toggle])]
+    chk_auto_cal: nwg::CheckBox,
+
     #[nwg_control(parent: gyro_frame, position: (12, 34), size: (220, 18), text: "DSU X (Eden pitch)")]
     lbl_gx: nwg::Label,
     #[nwg_control(parent: gyro_frame, position: (240, 30), size: (90, 22))]
@@ -199,7 +203,7 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::hide_window])]
     btn_hide: nwg::Button,
 
-    #[nwg_control(parent: window, position: (130, H - 36), size: (110, 26), text: "Recenter viz")]
+    #[nwg_control(parent: window, position: (130, H - 36), size: (110, 26), text: "Recalibrate")]
     #[nwg_events(OnButtonClick: [App::on_recenter])]
     btn_recenter: nwg::Button,
 
@@ -243,6 +247,8 @@ impl App {
             .set_check_state(checkbox_state(cfg.expose_to_network));
         self.chk_close_to_tray
             .set_check_state(checkbox_state(cfg.close_to_tray));
+        self.chk_auto_cal
+            .set_check_state(checkbox_state(cfg.auto_calibrate));
 
         let hidden = cfg.start_minimized || self.start_min_requested.get();
         self.set_window_shown(!hidden);
@@ -340,6 +346,20 @@ impl App {
         }
     }
 
+    fn on_auto_cal_toggle(&self) {
+        let want = is_checked(&self.chk_auto_cal);
+        let mut cfg = config::snapshot();
+        cfg.auto_calibrate = want;
+        match config::update_and_save(cfg) {
+            Ok(()) => self.lbl_save.set_text(if want {
+                "auto-calibration enabled."
+            } else {
+                "auto-calibration disabled — raw gyro passthrough."
+            }),
+            Err(e) => self.lbl_save.set_text(&format!("save failed: {e}")),
+        }
+    }
+
     fn on_close_to_tray_toggle(&self) {
         let want = is_checked(&self.chk_close_to_tray);
         let mut cfg = config::snapshot();
@@ -378,34 +398,41 @@ impl App {
         let host = config::bind_host(config::snapshot().expose_to_network);
         self.lbl_addr.set_text(&format!(
             "Listening on:    {}",
-            if s.bound_port == 0 {
+            if s.server.bound_port == 0 {
                 "binding…".to_string()
             } else {
-                format!("{host}:{}", s.bound_port)
+                format!("{host}:{}", s.server.bound_port)
             }
         ));
         self.lbl_id
-            .set_text(&format!("Server id:       0x{:08X}", s.server_id));
+            .set_text(&format!("Server id:       0x{:08X}", s.server.server_id));
+        let device_state = if s.server.device_active {
+            "controller awake"
+        } else {
+            "controller idle"
+        };
+        let cal_state: String = if !s.calibration.active {
+            "gyro: off".into()
+        } else if s.calibration.steady {
+            format!("gyro: locked {:.0}%", s.calibration.confidence * 100.0)
+        } else {
+            "gyro: calibrating…".into()
+        };
         self.lbl_subs.set_text(&format!(
-            "Subscribers:     {}     ({})",
-            s.subscribers,
-            if s.device_active {
-                "controller awake"
-            } else {
-                "controller idle"
-            }
+            "Subscribers:     {}     ({device_state} · {cal_state})",
+            s.server.subscribers,
         ));
         self.lbl_rate.set_text(&format!(
             "IMU rate:        {:>6.1} Hz   →  packets sent {:>6.1}/s   reqs {:>4.1}/s",
-            s.samples_per_sec, s.packets_per_sec, s.requests_per_sec,
+            s.server.samples_per_sec, s.server.packets_per_sec, s.server.requests_per_sec,
         ));
         self.lbl_gyro.set_text(&format!(
             "gyro  (deg/s)  [{:>+8.1} {:>+8.1} {:>+8.1}]",
-            s.last_gyro_dps[0], s.last_gyro_dps[1], s.last_gyro_dps[2]
+            s.motion.last_gyro_dps[0], s.motion.last_gyro_dps[1], s.motion.last_gyro_dps[2]
         ));
         self.lbl_accel.set_text(&format!(
             "accel (g)      [{:>+6.3} {:>+6.3} {:>+6.3}]",
-            s.last_accel_g[0], s.last_accel_g[1], s.last_accel_g[2]
+            s.motion.last_accel_g[0], s.motion.last_accel_g[1], s.motion.last_accel_g[2]
         ));
     }
 
@@ -451,7 +478,7 @@ impl App {
         let cy = (h_px as f32) * 0.5;
         let scale = (h_px as f32) * 0.32;
 
-        let q = stats::snapshot().orientation;
+        let q = stats::snapshot().motion.orientation;
         let project = |v: [f32; 3]| -> (i32, i32) {
             let r = quat_rotate(q, v);
             ((cx + r[0] * scale) as i32, (cy - r[1] * scale) as i32)
@@ -538,6 +565,8 @@ impl App {
                     .set_check_state(checkbox_state(cfg.expose_to_network));
                 self.chk_close_to_tray
                     .set_check_state(checkbox_state(cfg.close_to_tray));
+                self.chk_auto_cal
+                    .set_check_state(checkbox_state(cfg.auto_calibrate));
                 self.suppress_change.set(false);
                 self.lbl_save.set_text("restored defaults.");
             }
@@ -548,7 +577,7 @@ impl App {
     fn on_recenter(&self) {
         stats::RECENTER_REQUEST.store(true, Ordering::Relaxed);
         stats::RECALIBRATE_REQUEST.store(true, Ordering::Relaxed);
-        self.lbl_save.set_text("recentered & recalibrating gyro.");
+        self.lbl_save.set_text("recalibrating gyro.");
     }
 
     fn on_quit(&self) {
