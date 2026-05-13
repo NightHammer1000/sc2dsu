@@ -183,9 +183,13 @@ pub struct App {
     #[nwg_events(OnButtonClick: [App::on_start_min_toggle])]
     chk_start_min: nwg::CheckBox,
 
-    #[nwg_control(parent: sys_frame, position: (12, 90), size: (440, 18), text: "Hide to tray on window close (don't quit)")]
+    #[nwg_control(parent: sys_frame, position: (12, 90), size: (320, 18), text: "Hide to tray on window close (don't quit)")]
     #[nwg_events(OnButtonClick: [App::on_close_to_tray_toggle])]
     chk_close_to_tray: nwg::CheckBox,
+
+    #[nwg_control(parent: sys_frame, position: (360, 86), size: (150, 24), text: "Restore defaults")]
+    #[nwg_events(OnButtonClick: [App::on_restore_defaults])]
+    btn_restore: nwg::Button,
 
     #[nwg_control(parent: Some(&data.window), position: (10, 610), size: (W - 20, 152))]
     #[nwg_events(OnPaint: [App::on_viz_paint(SELF, EVT_DATA)])]
@@ -511,6 +515,34 @@ impl App {
 
     fn hide_window(&self) {
         self.set_window_shown(false);
+    }
+
+    fn on_restore_defaults(&self) {
+        let prompt = nwg::MessageParams {
+            title: "Restore defaults",
+            content: "Reset all settings to defaults?",
+            buttons: nwg::MessageButtons::YesNo,
+            icons: nwg::MessageIcons::Warning,
+        };
+        if !matches!(nwg::modal_message(&self.window, &prompt), nwg::MessageChoice::Yes) {
+            return;
+        }
+        match config::update_and_save(config::Config::DEFAULT) {
+            Ok(()) => {
+                let cfg = config::snapshot();
+                self.suppress_change.set(true);
+                self.populate_from_config();
+                self.chk_start_min
+                    .set_check_state(checkbox_state(cfg.start_minimized));
+                self.chk_expose
+                    .set_check_state(checkbox_state(cfg.expose_to_network));
+                self.chk_close_to_tray
+                    .set_check_state(checkbox_state(cfg.close_to_tray));
+                self.suppress_change.set(false);
+                self.lbl_save.set_text("restored defaults.");
+            }
+            Err(e) => self.lbl_save.set_text(&format!("restore failed: {e}")),
+        }
     }
 
     fn on_recenter(&self) {
