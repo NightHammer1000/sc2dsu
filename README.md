@@ -16,6 +16,7 @@ HID protocol from SDL3 [`SDL_hidapi_steam_triton.c`](https://github.com/libsdl-o
 
 # Notice on SDL Native Emulators
 Emulators that support the Controller Nativly like RPCS3 need the Steam Overlay disabled on their Shortcut to stop Steam Input from Injecting and Hiding the Controller.
+SDL Native Programms also do not need this Tool to access Gyro. So. No. You dont need this for RPCS3
 
 
 # Like it? Found it useful?
